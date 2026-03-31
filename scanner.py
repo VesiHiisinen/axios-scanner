@@ -42,15 +42,30 @@ class Colors:
     RESET = '\033[0m'
 
 
+class ProjectInfo:
+    """Track information about a scanned project"""
+    def __init__(self, path: Path):
+        self.path = path
+        self.has_lock_file = False
+        self.has_node_modules = False
+        self.axios_version: Optional[str] = None
+        self.plain_crypto_js_version: Optional[str] = None
+        self.other_deps: Dict[str, str] = {}
+        self.source_file: Optional[str] = None
+        self.is_compromised = False
+        self.scan_status = "unknown"
+
 class Scanner:
-    def __init__(self, root_path: str, use_colors: bool = True):
+    def __init__(self, root_path: str, use_colors: bool = True, verbose: bool = False):
         self.root_path = Path(root_path).resolve()
         self.threats: List[Dict] = []
         self.warnings: List[Dict] = []
         self.scanned_projects: Set[str] = set()
         self.skipped_projects: Set[str] = set()  # Projects skipped due to old timestamps
+        self.project_inventory: Dict[str, ProjectInfo] = {}  # Detailed project tracking
         self.scan_time = datetime.now()
         self.use_colors = use_colors
+        self.verbose = verbose
         
     def log(self, message: str, color: str = Colors.CYAN):
         """Print colored message (only if colors enabled)"""
@@ -120,8 +135,14 @@ class Scanner:
             lock_mtime = lock_file.stat().st_mtime
             if lock_mtime < ATTACK_TIMESTAMP:
                 # Project last touched before attack - cannot be compromised
-                self.skipped_projects.add(str(project_path))
-                self.scanned_projects.add(str(project_path))  # Count as processed
+                # Still track it in inventory but mark as skipped
+                project_key = str(project_path)
+                if project_key not in self.project_inventory:
+                    self.project_inventory[project_key] = ProjectInfo(project_path)
+                self.project_inventory[project_key].has_lock_file = True
+                self.project_inventory[project_key].source_file = str(lock_file)
+                self.skipped_projects.add(project_key)
+                self.scanned_projects.add(project_key)  # Count as processed
                 return
         except Exception:
             pass  # If we can't get mtime, scan anyway
@@ -225,9 +246,28 @@ class Scanner:
                 
     def _check_package(self, name: str, version: str, source: str, 
                       lock_file: Path, project_path: Path) -> None:
-        """Check if a package is malicious"""
+        """Check if a package is malicious and track project inventory"""
+        # Get or create project info
+        project_key = str(project_path)
+        if project_key not in self.project_inventory:
+            self.project_inventory[project_key] = ProjectInfo(project_path)
+        
+        project_info = self.project_inventory[project_key]
+        project_info.has_lock_file = True
+        project_info.source_file = str(lock_file)
+        
+        # Track axios and plain-crypto-js versions
+        if name == 'axios':
+            project_info.axios_version = version
+        elif name == 'plain-crypto-js':
+            project_info.plain_crypto_js_version = version
+            project_info.other_deps[name] = version
+        
+        # Check if malicious
         if name in MALICIOUS_PACKAGES:
             if version in MALICIOUS_PACKAGES[name]:
+                project_info.is_compromised = True
+                project_info.scan_status = "compromised"
                 threat = {
                     'package': name,
                     'version': version,
@@ -239,6 +279,10 @@ class Scanner:
                 }
                 self.threats.append(threat)
                 self.log(f"    ⚠️  THREAT: {name}@{version} in {source}", Colors.RED)
+            else:
+                # Safe version
+                if project_info.scan_status not in ["compromised"]:
+                    project_info.scan_status = "safe"
                 
     def _scan_node_modules_directly(self) -> None:
         """Scan node_modules directories directly"""
@@ -270,6 +314,14 @@ class Scanner:
         except Exception:
             pass  # If we can't get mtime, scan anyway
         
+        # Get or create project info
+        project_key = str(project_path)
+        if project_key not in self.project_inventory:
+            self.project_inventory[project_key] = ProjectInfo(project_path)
+        
+        project_info = self.project_inventory[project_key]
+        project_info.has_node_modules = True
+        
         # Check for malicious packages directly
         for pkg_name in MALICIOUS_PACKAGES:
             pkg_path = nm_path / pkg_name
@@ -280,7 +332,16 @@ class Scanner:
                     try:
                         data = json.loads(pkg_json.read_text(encoding='utf-8', errors='ignore'))
                         version = data.get('version', 'unknown')
+                        
+                        # Track the version
+                        if pkg_name == 'axios':
+                            project_info.axios_version = version
+                        elif pkg_name == 'plain-crypto-js':
+                            project_info.plain_crypto_js_version = version
+                        
                         if version in MALICIOUS_PACKAGES[pkg_name]:
+                            project_info.is_compromised = True
+                            project_info.scan_status = "compromised"
                             threat = {
                                 'package': pkg_name,
                                 'version': version,
@@ -293,6 +354,10 @@ class Scanner:
                             if threat not in self.threats:
                                 self.threats.append(threat)
                                 self.log(f"    ⚠️  THREAT: {pkg_name}@{version} in node_modules", Colors.RED)
+                        else:
+                            # Safe version
+                            if project_info.scan_status not in ["compromised"]:
+                                project_info.scan_status = "safe"
                     except Exception:
                         pass
                         
@@ -430,9 +495,99 @@ class Scanner:
                     if nm_path.is_dir():
                         self._scan_single_node_modules(nm_path)
                         
+    def _add_project_inventory_table(self, report_lines: List[str]) -> None:
+        """Add a detailed project inventory table showing all projects and their status"""
+        report_lines.extend([
+            "",
+            "## 📋 Complete Project Inventory",
+            "",
+            "Full list of all projects and Node.js-based tools found in the scan:",
+            "",
+            "| Project | Status | Axios | plain-crypto-js | Type |",
+            "|---------|--------|-------|-----------------|------|",
+        ])
+        
+        # Sort projects by path for consistent ordering
+        sorted_projects = sorted(self.project_inventory.items(), 
+                               key=lambda x: x[1].path.relative_to(self.root_path) if x[1].path != self.root_path else Path(''))
+        
+        for project_key, project_info in sorted_projects:
+            try:
+                # Get relative path for display
+                try:
+                    project_name = str(project_info.path.relative_to(self.root_path))
+                    if not project_name or project_name == '.':
+                        project_name = '(root)'
+                except:
+                    project_name = str(project_info.path)
+                    
+                # Determine status emoji
+                if project_info.is_compromised:
+                    status = '⚠️ COMPROMISED'
+                elif project_info.scan_status == 'safe':
+                    status = '✅ SAFE'
+                elif str(project_info.path) in self.skipped_projects:
+                    status = '⏭️ SKIPPED (pre-attack)'
+                elif project_info.has_lock_file or project_info.has_node_modules:
+                    status = '✓ CLEAN'
+                else:
+                    status = 'ℹ️ NO DEPS'
+                
+                # Get axios version status
+                if project_info.axios_version:
+                    if project_info.axios_version in MALICIOUS_PACKAGES['axios']:
+                        axios_status = f"**{project_info.axios_version}** ⚠️"
+                    else:
+                        axios_status = f"{project_info.axios_version} ✅"
+                else:
+                    axios_status = '—'
+                
+                # Get plain-crypto-js version status
+                if project_info.plain_crypto_js_version:
+                    if project_info.plain_crypto_js_version in MALICIOUS_PACKAGES['plain-crypto-js']:
+                        crypto_status = f"**{project_info.plain_crypto_js_version}** ⚠️"
+                    else:
+                        crypto_status = f"{project_info.plain_crypto_js_version} ✅"
+                else:
+                    crypto_status = '—'
+                
+                # Determine project type
+                if project_info.path == Path.home() / '.nvm':
+                    project_type = 'NVM'
+                elif 'electron' in str(project_info.path).lower():
+                    project_type = 'Electron'
+                elif 'opencode' in str(project_info.path).lower():
+                    project_type = 'CLI Tool'
+                elif project_info.has_lock_file and project_info.has_node_modules:
+                    project_type = 'Full Project'
+                elif project_info.has_lock_file:
+                    project_type = 'Project (no node_modules)'
+                elif project_info.has_node_modules:
+                    project_type = 'Installed'
+                else:
+                    project_type = 'Unknown'
+                
+                # Escape pipe characters in project name
+                project_name = project_name.replace('|', '\\|')
+                
+                report_lines.append(f"| {project_name} | {status} | {axios_status} | {crypto_status} | {project_type} |")
+            except Exception as e:
+                # Skip problematic entries but log them
+                report_lines.append(f"| {project_key} | ERROR: {e} | — | — | Error |")
+        
+        report_lines.extend([
+            "",
+            "**Legend:**",
+            "- **Status:** Shows if project was scanned or skipped",
+            "- **Axios:** Version of axios if found (✅ = safe, ⚠️ = malicious)",
+            "- **plain-crypto-js:** Version if found (✅ = safe, ⚠️ = malicious)",
+            "- **Type:** Type of Node.js installation",
+            "",
+        ])
+
     def _generate_report(self) -> None:
-        """Generate markdown report"""
-        report_path = self.root_path / f'axios_scan_report_{self.scan_time.strftime("%Y%m%d_%H%M%S")}.md'
+        """Generate markdown report in current working directory"""
+        report_path = Path.cwd() / f'axios_scan_report_{self.scan_time.strftime("%Y%m%d_%H%M%S")}.md'
         
         report_lines = [
             "# Axios Supply Chain Attack Scan Report",
@@ -493,6 +648,10 @@ class Scanner:
                 "Your projects appear to be safe from the Axios supply chain attack.",
                 "",
             ])
+        
+        # Add comprehensive project inventory (verbose mode only)
+        if self.verbose:
+            self._add_project_inventory_table(report_lines)
             
         # Add warnings section
         if self.warnings:
@@ -552,12 +711,27 @@ class Scanner:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 scanner.py /path/to/parent/directory")
-        print("Example: python3 scanner.py /home/user/projects")
-        sys.exit(1)
-        
-    root_path = sys.argv[1]
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Axios Supply Chain Attack Scanner - Detects malicious packages from March 31, 2026 npm compromise',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 scanner.py /home/user/projects        # Normal scan
+  python3 scanner.py /home/user/projects -v     # Verbose scan with full inventory
+  python3 scanner.py . --verbose                # Scan current directory with details
+        """
+    )
+    
+    parser.add_argument('path', help='Directory to scan')
+    parser.add_argument('-v', '--verbose', action='store_true', 
+                       help='Enable verbose mode with detailed project inventory table')
+    parser.add_argument('--no-color', action='store_true',
+                       help='Disable colored output')
+    
+    args = parser.parse_args()
+    root_path = args.path
     
     if not os.path.exists(root_path):
         print(f"Error: Path does not exist: {root_path}")
@@ -568,8 +742,8 @@ def main():
         sys.exit(1)
     
     # Disable colors if NO_COLOR is set or output is not a terminal
-    use_colors = not os.environ.get('NO_COLOR') and sys.stdout.isatty()
-    scanner = Scanner(root_path, use_colors=use_colors)
+    use_colors = not args.no_color and not os.environ.get('NO_COLOR') and sys.stdout.isatty()
+    scanner = Scanner(root_path, use_colors=use_colors, verbose=args.verbose)
     scanner.scan()
 
 
