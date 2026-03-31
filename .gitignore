@@ -75,5 +75,5 @@ cython_debug/
 .DS_Store
 Thumbs.db
 # Scan reports (keep if you want them in repo, remove if not)
-# axios_scan_report_*.md
-# axios_quick_scan_report.md
+axios_scan_report_*.md
+axios_quick_scan_report.md
