@@ -22,11 +22,13 @@ echo ""
 if [ $# -eq 0 ]; then
     echo "Usage:"
     echo "  ./run_scan.sh /path/to/projects        # Full recursive scan"
+    echo "  ./run_scan.sh /path/to/projects -v     # Verbose scan with table"
     echo "  ./run_scan.sh --quick                  # Quick current directory scan"
     echo "  ./run_scan.sh --global                 # Scan global npm only"
     echo ""
-    echo "Example:"
+    echo "Examples:"
     echo "  ./run_scan.sh /home/user/projects"
+    echo "  ./run_scan.sh . -v"
     exit 1
 fi
 
@@ -39,13 +41,18 @@ elif [ "$1" == "--global" ]; then
     python3 "$SCRIPT_DIR/quick_scan.py" --global-only
 else
     TARGET="$1"
+    shift  # Remove first argument, keep rest (like -v, --verbose, etc.)
+    
     if [ ! -d "$TARGET" ]; then
         echo "Error: Directory does not exist: $TARGET"
         exit 1
     fi
     
     echo "Running full scan on: $TARGET"
+    if [ $# -gt 0 ]; then
+        echo "Additional options: $@"
+    fi
     echo "This may take a while for large directories..."
     echo ""
-    python3 "$SCRIPT_DIR/scanner.py" "$TARGET"
+    python3 "$SCRIPT_DIR/scanner.py" "$TARGET" "$@"
 fi
