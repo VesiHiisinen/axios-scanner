@@ -508,8 +508,17 @@ class Scanner:
         ])
         
         # Sort projects by path for consistent ordering
-        sorted_projects = sorted(self.project_inventory.items(), 
-                               key=lambda x: x[1].path.relative_to(self.root_path) if x[1].path != self.root_path else Path(''))
+        def get_relative_path(item):
+            try:
+                return str(item[1].path.relative_to(self.root_path))
+            except ValueError:
+                # Path is outside root (e.g., global npm), show full path or "[global]"
+                path_str = str(item[1].path)
+                if 'node_modules' in path_str and '/.nvm/' in path_str:
+                    return f"[global] {path_str}"
+                return path_str
+        
+        sorted_projects = sorted(self.project_inventory.items(), key=lambda x: get_relative_path(x))
         
         for project_key, project_info in sorted_projects:
             try:
@@ -596,11 +605,13 @@ class Scanner:
             f"**Root Directory:** {self.root_path}",
             f"**Projects Scanned:** {len(self.scanned_projects)}",
             "",
-            "## ⚠️ Threats Found",
-            "",
         ]
         
         if self.threats:
+            report_lines.extend([
+                "## ⚠️ Threats Found",
+                "",
+            ])
             report_lines.append(f"**CRITICAL: {len(self.threats)} malicious package(s) detected!**")
             report_lines.append("")
             for i, threat in enumerate(self.threats, 1):
@@ -643,7 +654,9 @@ class Scanner:
             ])
         else:
             report_lines.extend([
-                "✅ **No malicious packages detected!**",
+                "## Scan Results",
+                "",
+                "✅ **No threats found**",
                 "",
                 "Your projects appear to be safe from the Axios supply chain attack.",
                 "",
